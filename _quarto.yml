@@ -13,7 +13,7 @@ website:
     
 format:
   html:
-    theme: LUX
+    theme: Lux
     toc: false
 
 editor:
