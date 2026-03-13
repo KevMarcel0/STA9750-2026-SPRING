@@ -1,3 +1,4 @@
+---
 title: "Mini-Project 01 - Assessing the Impact of SFFA on Campus Diversity One-Year Later"
 author: "Kevin Marcelin"
 editor:
@@ -639,7 +640,7 @@ The numbers are clear, the student body at John Jay College is changing and we m
 
 ## AI Usage Statement
 
-::: {.callout-note collapse="true"}
+::: {.callout-note collapse="true" title="AI Usage Statement"}
 
 Generative AI tools were used in a limited capacity to assist with aspects of this mini-project. AI assistance was primarily used to help troubleshoot R coding issues, understand error messages, and refine code for data manipulation and visualization using packages such as `dplyr`, `tidyr`, and `gt`. The analytical approach, interpretation of the IPEDS dataset, and written discussion of enrollment and demographic trends were completed by the author. AI outputs were reviewed, edited, and validated to ensure the accuracy of the analysis and the appropriateness of the final report.
 :::
