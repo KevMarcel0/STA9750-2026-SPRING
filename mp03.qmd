@@ -1,0 +1,475 @@
+**This is only a basic Mini-Project Template.**
+**Delete this note and customize formatting according to your preferences and**
+**the Mini-Project instructions. Your document must start the `---` below**
+---
+title: "Mini-Project 03 - Who Goes There? US Internal Migration and Implications for Congressional Reapportionment"
+author: "KevMarcel0"
+editor:
+    mode: source
+format:
+    html:
+        code-fold: true
+---
+
+## Introduction
+
+A suitable introduction goes here. In this mini-project, I intend to demonstrate
+my skills at Data Import/API Usage/File Parsing in an analysis of Census Data/Migration Flows data.
+
+## Data Acquisition and Preparation
+
+Code related to Data Acquisition and Preparation goes here.
+
+Remember that code blocks look like this: 
+
+
+
+```{r}
+library(tidycensus)
+library(gt)
+
+ny_income <- get_acs(
+    c(median_household_income="B19013_001"), 
+    state="NY", 
+    geography="county", 
+    year=2018, 
+    survey="acs1"
+)
+```
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+load_state_population <- function(year = 2015:2024) {
+    
+    # Create folder if it does not exist
+    if(!dir.exists(file.path("data", "mp03"))){
+        dir.create(file.path("data", "mp03"), showWarnings = FALSE, recursive = TRUE)
+    }
+    
+    # Download and combine data across years
+    pop_data <- map_dfr(
+        year,
+        \(yr) {
+            get_acs(
+                geography = "state",
+                variables = c(total_population = "B01003_001"),
+                year = yr,
+                geometry = TRUE,
+                cache_table = TRUE
+            ) |>
+                transmute(
+                    total_population = estimate,
+                    state = NAME,
+                    year = yr
+                )
+        }
+    )
+    
+    pop_data
+}
+# Run function
+state_pop <- load_state_population()
+# Check result
+glimpse(state_pop)
+head(state_pop)
+
+```
+
+
+
+```{r}
+#Task 2
+#| echo: false
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(openxlsx)
+
+state_to_state_migration_2024 <- function() {
+  
+  if (!dir.exists(file.path("data", "mp03"))) {
+    dir.create(file.path("data", "mp03"), showWarnings = FALSE, recursive = TRUE)
+  }
+  
+  xlsx_file <- file.path(
+    "data",
+    "mp03",
+    "State_to_State_Migration_Table_2024_T13.xlsx"
+  )
+  
+  if (!file.exists(xlsx_file)) {
+    download.file(
+      url = "https://www2.census.gov/programs-surveys/demo/tables/geographic-mobility/2024/state-to-state-migration/State_to_State_Migration_Table_2024_T13.xlsx",
+      destfile = xlsx_file,
+      mode = "wb",
+      quiet = TRUE
+    )
+  }
+  
+  table_csv <- file.path("data", "mp03", "state_flows_2024_table.csv")
+  supp_csv  <- file.path("data", "mp03", "state_flows_2024_supp.csv")
+  
+  if (!file.exists(table_csv) || !file.exists(supp_csv)) {
+    
+    table_df <- read.xlsx(
+      xlsx_file,
+      sheet = "Table",
+      startRow = 8,
+      colNames = TRUE
+    ) |> as_tibble()
+    
+    supp_df <- read.xlsx(
+      xlsx_file,
+      sheet = "Supplemental - Current Res",
+      startRow = 8,
+      colNames = TRUE
+    ) |> as_tibble()
+    
+    write.csv(table_df, table_csv, row.names = FALSE)
+    write.csv(supp_df, supp_csv, row.names = FALSE)
+  }
+  
+  states_with_dc <- c(
+    state.name[1:8],
+    "District of Columbia",
+    state.name[9:50]
+  )
+  
+  states_abbrev_with_dc <- c(
+    state.abb[1:8],
+    "DC",
+    state.abb[9:50]
+  )
+  
+  flow_data <- suppressMessages(
+    read_csv(table_csv, show_col_types = FALSE)
+  ) |>
+    rename(
+      state_current = X1,
+      state_1y = X2,
+      population = Estimate
+    ) |>
+    mutate(
+      state_current = str_squish(as.character(state_current)),
+      state_1y = str_squish(as.character(state_1y)),
+      population = as.character(population)
+    ) |>
+    filter(
+      !is.na(state_current),
+      !is.na(state_1y),
+      state_current %in% states_with_dc,
+      state_1y %in% states_with_dc,
+      population != "X"
+    ) |>
+    mutate(
+      state_current = recode(state_current, !!!setNames(states_abbrev_with_dc, states_with_dc)),
+      state_1y = recode(state_1y, !!!setNames(states_abbrev_with_dc, states_with_dc)),
+      population = if_else(population == "N", "0", population),
+      population = as.integer(population),
+      year_current = 2024L,
+      year_1y = 2023L
+    ) |>
+    filter(
+      state_current != "DC",
+      state_1y != "DC"
+    ) |>
+    select(state_current, state_1y, population, year_current, year_1y)
+  
+  stayed_data <- suppressMessages(
+    read_csv(supp_csv, show_col_types = FALSE)
+  )
+  
+  # adjust these names if needed after inspecting the supplemental CSV
+  stayed_data <- stayed_data |>
+    select(1:3) |>
+    rename(
+      state_current = 1,
+      stayed_same_house = 2,
+      moved_within_state = 3
+    ) |>
+    mutate(
+      state_current = str_squish(as.character(state_current))
+    ) |>
+    filter(
+      !is.na(state_current),
+      state_current %in% states_abbrev_with_dc
+    ) |>
+    mutate(
+      stayed_same_house = as.integer(replace_na(as.character(stayed_same_house), "0")),
+      moved_within_state = as.integer(replace_na(as.character(moved_within_state), "0")),
+      population = stayed_same_house + moved_within_state,
+      state_1y = state_current,
+      year_current = 2024L,
+      year_1y = 2023L
+    ) |>
+    select(state_current, state_1y, population, year_current, year_1y)
+  
+  bind_rows(flow_data, stayed_data)
+}
+```
+
+```{r}
+flows_2024 <- state_to_state_migration_2024()
+
+dim(flows_2024)
+head(flows_2024)
+```
+
+
+```{r}
+# Task 3
+#| echo: false
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(openxlsx)
+library(vctrs)
+
+state_to_state_migration_2023 <- function() {
+  
+  if (!dir.exists(file.path("data", "mp03"))) {
+    dir.create(file.path("data", "mp03"), showWarnings = FALSE, recursive = TRUE)
+  }
+  
+  xlsx_file <- file.path(
+    "data",
+    "mp03",
+    "State_to_State_Migration_Table_2023_T13.xlsx"
+  )
+  
+  if (!file.exists(xlsx_file)) {
+    download.file(
+      url = "https://www2.census.gov/programs-surveys/demo/tables/geographic-mobility/2023/state-to-state-migration/State_to_State_Migration_Table_2023_T13.xlsx",
+      destfile = xlsx_file,
+      mode = "wb",
+      quiet = TRUE
+    )
+  }
+  
+  states_with_dc <- c(
+    state.name[1:8],
+    "District of Columbia",
+    state.name[9:50]
+  )
+  
+  states_abbrev_with_dc <- c(
+    state.abb[1:8],
+    "DC",
+    state.abb[9:50]
+  )
+  
+  name_to_abbrev <- setNames(states_abbrev_with_dc, states_with_dc)
+  
+  # ---------------------------
+  # 1. Stayed within the state
+  # First 6 columns only
+  # ---------------------------
+  stay_data <- read.xlsx(
+  xlsx_file,
+  rows = 9:65,
+  cols = 1:6,
+  colNames = FALSE
+) |>
+  as_tibble(.name_repair = "minimal") |>
+  select(
+    state_current = 1,
+    stayed_same_house = 2,
+    moved_within_state = 3
+  ) |>
+  mutate(
+    state_current = stringr::str_squish(as.character(state_current))
+  ) |> 
+  filter(!is.na(state_current)) |>
+  filter(state_current %in% states_with_dc) |>
+  mutate(
+    state_current = recode(state_current, !!!name_to_abbrev),
+    stayed_same_house = as.integer(replace_na(as.character(stayed_same_house), "0")),
+    moved_within_state = as.integer(replace_na(as.character(moved_within_state), "0")),
+    population = stayed_same_house + moved_within_state,
+    state_1y = state_current,
+    year_current = 2023L,
+    year_1y = 2022L
+  ) |>
+  filter(state_current != "DC") |>
+  select(state_current, state_1y, population, year_current, year_1y)
+  
+   # ---------------------------
+  # 2. Actual state-to-state flows
+  # Columns J:DG only
+  # ---------------------------
+  row_states <- read.xlsx(
+    xlsx_file,
+    rows = 9:65,
+    cols = 1,
+    colNames = FALSE
+  ) |>
+    as_tibble(.name_repair = "minimal") |>
+    rename(state_1y = 1)
+  
+  flow_wide <- read.xlsx(
+    xlsx_file,
+    rows = 9:65,
+    cols = 10:111,
+    colNames = FALSE
+  ) |>
+    as_tibble(.name_repair = "minimal")
+  
+  # make sure both have the same number of rows
+  n_rows <- min(nrow(row_states), nrow(flow_wide))
+  row_states <- slice(row_states, 1:n_rows)
+  flow_wide  <- slice(flow_wide, 1:n_rows)
+  
+  colnames(flow_wide) <- vctrs::vec_interleave(states_with_dc, NA_character_)
+  
+ flow_data <- bind_cols(row_states, flow_wide) |>
+  select(state_1y, any_of(states_with_dc)) |>
+  filter(!is.na(state_1y), state_1y %in% states_with_dc) |>
+  mutate(
+    across(any_of(states_with_dc), as.character)
+  ) |>
+  pivot_longer(
+    cols = -state_1y,
+    names_to = "state_current",
+    values_to = "population"
+  ) |>
+  filter(
+    !is.na(population),
+    state_current != "District of Columbia",
+    state_1y != "District of Columbia",
+    state_current != state_1y
+  ) |>
+  mutate(
+    state_current = recode(state_current, !!!name_to_abbrev),
+    state_1y = recode(state_1y, !!!name_to_abbrev),
+    population = if_else(population == "N", "0", population),
+    population = as.integer(population),
+    year_current = 2023L,
+    year_1y = 2022L
+  ) |>
+  select(state_current, state_1y, population, year_current, year_1y)
+}
+```
+
+
+
+```{r}
+library(tidyverse)
+state_to_state_migration <- function() {
+  
+  flows_2024 <- state_to_state_migration_2024()
+  flows_2023 <- state_to_state_migration_2023()
+  
+  bind_rows(flows_2024, flows_2023)
+}
+```
+
+```{r}
+# Task 5
+#| echo: false
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(jsonlite)
+library(stringr)
+
+move_row_to_colnames <- function(X, row = 1) {
+  X <- as_tibble(X)
+  Xrow <- X[row, ]
+  X <- X[-row, ]
+  colnames(X) <- unlist(Xrow)
+  readr::type_convert(X)
+}
+
+pull_state_from_metro <- function(metro_name) {
+  str_extract(
+    metro_name,
+    ".*, (\\S{2})[-[:alpha:]]* Metro Area",
+    group = 1
+  )
+}
+
+metro_to_metro_migration <- function() {
+  
+  if (!dir.exists(file.path("data", "mp03"))) {
+    dir.create(file.path("data", "mp03"), showWarnings = FALSE, recursive = TRUE)
+  }
+  
+  json_file <- file.path(
+    "data",
+    "mp03",
+    "metro_to_metro_migration_2020.json"
+  )
+  
+  api_url <- paste0(
+    "https://api.census.gov/data/2020/acs/flows",
+    "?get=MOVEDIN,MOVEDOUT,FULL1_NAME,FULL2_NAME",
+    "&for=metropolitan%20statistical%20area/micropolitan%20statistical%20area:*"
+  )
+  
+  if (!file.exists(json_file)) {
+    download.file(
+      url = api_url,
+      destfile = json_file,
+      mode = "wb",
+      quiet = TRUE
+    )
+  }
+  
+  metro_data <- read_json(
+    json_file,
+    simplifyVector = TRUE
+  ) |>
+    move_row_to_colnames() |>
+    select(
+      metro_current = FULL1_NAME,
+      metro_1y = FULL2_NAME,
+      moved_in = MOVEDIN,
+      moved_out = MOVEDOUT
+    ) |>
+    mutate(
+      metro_current_state = pull_state_from_metro(metro_current),
+      metro_1y_state = pull_state_from_metro(metro_1y)
+    )
+  
+  metro_data
+}
+
+```
+
+
+```{r}
+metro_flows <- metro_to_metro_migration()
+
+dim(metro_flows)
+head(metro_flows)
+
+```
+
+
+## Exploratory Analysis
+
+Code related to Exploratory Data Analysis goes here. This may include
+exploratory graphics, instructor-provided exploratory questions, or other
+similar elements. 
+
+
+
+
+## Final Insights and Deliverable
+
+Code related to the final deliverable of the assignment goes here. 
+
+
+
+------------------------------------------------------------------------
+
+This work ©2025 by KevMarcel0 was initially prepared as a Mini-Project for
+STA 9750 at Baruch College. More details about this course can be found at
+[the course site](https://michael-weylandt.com/STA9750) and instructions for
+this assignment can be found at 
+[MP #03](https://michael-weylandt.com/STA9750/mini/mini03.html)
