@@ -1,0 +1,609 @@
+---
+title: "Do Food-Related 311 Complaints Predict Worse Restaurant Inspection Outcomes?"
+subtitle: "STA 9750 | Individual Report | Temporal Dynamics of Complaints and Inspection Outcomes in NYC"
+author: "Kevin Marcelin"
+date: "2026-05-21"
+editor:
+    mode: source
+format:
+    html:
+        theme: flatly
+        toc: true
+        toc-float: true
+        toc-depth: 3
+        number-sections: true
+        code-fold: true
+        code-tools: true
+        fig-width: 10
+        fig-height: 6
+        self-contained: true
+execute:
+    echo: true
+    message: false
+    warning: false
+    fig-align: center
+---
+
+```{r packages}
+pkgs <- c("tidyverse", "lubridate", "scales", "tidycensus",
+          "knitr", "kableExtra", "broom", "glue", "httr2", "jsonlite")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(tidycensus)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(glue)
+library(httr2)
+library(jsonlite)
+```
+
+```{r theme}
+theme_nyc <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(color = "grey40", size = 12),
+      plot.caption  = element_text(color = "grey55", size = 9),
+      axis.title    = element_text(size = 11),
+      panel.grid.minor = element_blank()
+    )
+}
+```
+
+## Overarching Question and My Contribution
+
+This is part of a team project looking at whether neighborhoods with more food complaints end up with worse restaurant inspection scores. The other analyses already answered that — yes, ZIP codes with more 311 complaints also have more critical violations when you look across neighborhoods at the same point in time. My part tries to go one step further and asks whether complaints come *before* the worse outcomes, or if they're just showing up at the same time.
+
+That difference matters more than it might seem. If complaints in month *t* reliably predict worse inspection results in *t+1*, *t+2*, or *t+3*, then you could actually use 311 data as an early warning system. Regulators could watch complaint trends and send inspectors into a neighborhood before things get worse. But if complaints and violations are just happening together because both are driven by the same underlying neighborhood conditions, then 311 data tells you what's going on right now, not what's coming next.
+
+My specific question: do food-related 311 complaints in a given month predict worse inspection outcomes one to three months later? I test this using lagged Pearson correlations and a panel regression with ZIP fixed effects that controls for anything that doesn't change within a ZIP over time.
+
+The answer is basically no. Complaint spikes don't predict inspection deterioration in the months that follow. That's not really a failure — it actually tells you something useful about why complaints and violations are correlated at all. They're both reacting to the same neighborhood conditions at the same time, not one causing the other.
+
+To answer this I combined three datasets:
+
+- **DOHMH Restaurant Inspection Results** — raw inspection records by restaurant, ZIP code and date, pulled directly from the NYC Open Data API
+- **NYC 311 Complaint Data** — food-related service requests from the same API
+- **ACS Demographic Profiles** — median income, poverty rate and racial composition by ZIP code via `tidycensus`
+
+## Data Quality Assessment
+
+Before getting into the results, there are a few data issues worth knowing about. Inspections don't happen on a regular calendar schedule. DOHMH uses a risk-based cycle where some restaurants get inspected every few weeks and others might go over a year between visits. When you roll everything up to the month level, a ZIP code's inspection outcomes that month only reflect whichever restaurants happened to get checked that month — which might not be representative of the whole neighborhood.
+
+That's a real problem for this kind of lagged analysis. A ZIP could have tons of complaints in month *t* but almost no inspections in *t+1* through *t+3*, and you'd have no way to detect a signal even if one was there. It also works the other way — a ZIP with a lot of inspections in a given month might show high critical rates just because more inspections happened, not because conditions were actually worse. Both of those effects push the correlations toward zero. So if the results come back null, the honest read is that it's probably an underestimate of whatever true relationship exists, not hard proof that there's nothing going on.
+
+The study covers January 2022 through early 2026, around 50 months of data. After the three-month lag window, you lose a few months of outcomes on each end. The ZIP fixed effects model then removes all the between-ZIP differences and only uses variation within each ZIP over time, which cuts down how much signal is left to work with. Both of those things make it harder to find significant results even if a real pattern exists.
+
+---
+
+## Data Acquisition
+
+```{r fetch-helper}
+# Paginated Socrata fetcher — handles datasets too large for a single API call
+fetch_all_socrata <- function(dataset_id, query = "",
+                               select = NULL, page_size = 50000) {
+  base_url <- glue("https://data.cityofnewyork.us/resource/{dataset_id}.json")
+  offset <- 0
+  pages  <- list()
+  repeat {
+    req <- request(base_url) |>
+      req_url_query(`$limit`  = page_size,
+                    `$offset` = offset,
+                    `$where`  = query)
+    if (!is.null(select))
+      req <- req |> req_url_query(`$select` = select)
+    page <- req |>
+      req_retry(max_tries = 3) |>
+      req_perform() |>
+      resp_body_json(simplifyVector = TRUE) |>
+      as_tibble()
+    if (nrow(page) == 0) break
+    message(glue("  {dataset_id}: {offset + nrow(page)} rows fetched"))
+    pages[[length(pages) + 1]] <- page
+    if (nrow(page) < page_size) break
+    offset <- offset + page_size
+  }
+  bind_rows(pages)
+}
+```
+
+```{r load-data}
+#| cache: true
+dir.create("data", showWarnings = FALSE)
+
+# DOHMH Inspections — dataset 43nn-pn8j
+if (!file.exists("data/raw_inspections.rds")) {
+  raw_inspections <- fetch_all_socrata(
+    "43nn-pn8j",
+    query  = "inspection_date >= '2022-01-01T00:00:00'",
+    select = "camis,boro,zipcode,inspection_date,score,critical_flag"
+  )
+  saveRDS(raw_inspections, "data/raw_inspections.rds")
+} else {
+  raw_inspections <- readRDS("data/raw_inspections.rds")
+}
+
+# NYC 311 Food Complaints — dataset erm2-nwe9
+if (!file.exists("data/raw_311.rds")) {
+  raw_311 <- fetch_all_socrata(
+    "erm2-nwe9",
+    query  = paste0(
+      "complaint_type IN (",
+      "'Food Establishment','Food Poisoning',",
+      "'Rodent','Unsanitary Condition',",
+      "'Harboring Bees/Wasps','Food - Hazardous Material'",
+      ") AND created_date >= '2022-01-01T00:00:00'"
+    ),
+    select = "unique_key,complaint_type,created_date,borough,incident_zip"
+  )
+  saveRDS(raw_311, "data/raw_311.rds")
+} else {
+  raw_311 <- readRDS("data/raw_311.rds")
+}
+```
+
+```{r load-acs}
+#| cache: true
+if (!file.exists("data/acs.rds")) {
+  acs <- get_acs(
+    geography = "zcta",
+    variables = c(
+      median_income   = "B19013_001",
+      total_pop       = "B01003_001",
+      pct_poverty_raw = "B17001_002",
+      pct_white_raw   = "B02001_002"
+    ),
+    year   = 2022,
+    survey = "acs5",
+    output = "wide"
+  ) |>
+    transmute(
+      zipcode       = GEOID,
+      median_income = median_incomeE,
+      total_pop     = total_popE,
+      pct_poverty   = pct_poverty_rawE / total_popE * 100,
+      pct_white     = pct_white_rawE   / total_popE * 100
+    )
+  saveRDS(acs, "data/acs.rds")
+} else {
+  acs <- readRDS("data/acs.rds")
+}
+```
+
+Both the DOHMH and 311 datasets are pulled from the NYC Open Data API using a paginated fetcher I wrote — the datasets are big enough that a single API call hits the limit, so it loops through pages until everything's downloaded. Both files get saved locally as `.rds` so they don't re-download every time the document renders. The ACS data uses `tidycensus` to pull the 2018-2022 5-year estimates at the ZIP code level.
+
+---
+
+## Data Cleaning
+
+```{r clean}
+inspections <- raw_inspections |>
+  mutate(
+    inspection_date = as_date(inspection_date),
+    score           = as.numeric(score),
+    is_critical     = str_detect(tolower(critical_flag), "critical") &
+                      !str_detect(tolower(critical_flag), "not"),
+    borough         = str_to_upper(str_trim(boro)),
+    zipcode         = str_pad(str_extract(zipcode, "\\d{5}"), 5, "left", "0"),
+    year            = year(inspection_date),
+    month           = floor_date(inspection_date, "month")
+  ) |>
+  filter(
+    !is.na(inspection_date),
+    year >= 2022,
+    borough %in% c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"),
+    !is.na(zipcode),
+    zipcode != "00000"
+  )
+
+complaints <- raw_311 |>
+  mutate(
+    date    = as_date(created_date),
+    year    = year(date),
+    month   = floor_date(date, "month"),
+    borough = str_to_upper(str_trim(borough)),
+    zipcode = str_pad(str_extract(incident_zip, "\\d{5}"), 5, "left", "0")
+  ) |>
+  filter(
+    !is.na(date),
+    year >= 2022,
+    borough %in% c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND"),
+    !is.na(zipcode),
+    zipcode != "00000"
+  )
+
+rm(raw_inspections, raw_311); gc()
+
+# Monthly ZIP-level summaries
+zip_insp_monthly <- inspections |>
+  group_by(zipcode, month) |>
+  summarise(
+    pct_critical = mean(is_critical, na.rm = TRUE),
+    mean_score   = mean(score, na.rm = TRUE),
+    .groups      = "drop"
+  )
+
+zip_comp_monthly <- complaints |>
+  count(zipcode, month, name = "comp_total")
+
+cat("ZIP-month inspection rows:", nrow(zip_insp_monthly), "\n")
+cat("ZIP-month complaint rows:",  nrow(zip_comp_monthly),  "\n")
+```
+
+Both datasets get filtered down to the five boroughs starting from January 2022, then rolled up to ZIP-month level. For inspections I'm using the share of inspections that came back with critical violations — that captures how serious the problems were, not just how many restaurants got checked. After cleaning I have `r nrow(zip_insp_monthly)` ZIP-month inspection rows and `r nrow(zip_comp_monthly)` complaint rows.
+
+---
+
+## Exploratory Analysis
+
+### City-Wide Monthly Trends
+
+```{r eda-city-trends}
+city_monthly <- zip_insp_monthly |>
+  group_by(month) |>
+  summarise(avg_pct_critical = mean(pct_critical, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    zip_comp_monthly |>
+      group_by(month) |>
+      summarise(total_comp = sum(comp_total), .groups = "drop"),
+    by = "month"
+  )
+
+ggplot(city_monthly, aes(x = month)) +
+  geom_col(aes(y = total_comp / 5000), fill = "#A8DADC", alpha = 0.7) +
+  geom_line(aes(y = avg_pct_critical), color = "#E63946", linewidth = 1.2) +
+  geom_point(aes(y = avg_pct_critical), color = "#E63946", size = 2) +
+  scale_y_continuous(
+    name     = "Avg % Critical Violations",
+    sec.axis = sec_axis(~ . * 5000, name = "Total Complaints", labels = comma)
+  ) +
+  labs(
+    title    = "City-Wide Monthly Trends: Complaints vs Critical Violations",
+    subtitle = "Bars = total complaints (right axis). Line = avg % critical (left axis).",
+    x        = NULL,
+    caption  = "Sources: DOHMH Inspections, NYC 311 (2022–2026)"
+  ) +
+  theme_nyc()
+```
+
+The chart shows an important pattern right away. Complaint volume spikes in the summer months — that's the rodent season effect — but those seasonal spikes don't seem to be followed by corresponding increases in critical violation rates in the months after. The critical violation rate line stays relatively flat across the whole study period, with no obvious upward movements following the complaint peaks in the bars. Complaints and violations are moving on different rhythms, with complaints driven partly by seasonal factors that may not be directly related to the food handling violations that inspectors actually cite as critical.
+
+### Within-ZIP Temporal Variation
+
+```{r within-zip-variation}
+zip_variation <- zip_comp_monthly |>
+  group_by(zipcode) |>
+  summarise(
+    cv_complaints = sd(comp_total) / mean(comp_total),
+    n_months      = n(),
+    .groups       = "drop"
+  ) |>
+  filter(n_months >= 12)
+
+cat("Median coefficient of variation in monthly complaints:",
+    round(median(zip_variation$cv_complaints, na.rm = TRUE), 3), "\n")
+cat("ZIP codes with at least 12 months of data:",
+    nrow(zip_variation), "\n")
+```
+
+The coefficient of variation comes back fairly high, which means complaint counts do jump around a lot from month to month within individual ZIP codes. That's actually important — the ZIP fixed effects model can only identify a relationship using within-ZIP changes over time. If complaint volume were basically flat within each ZIP there would be nothing for the model to work with. The fact that there's real within-ZIP variation means the regression has enough movement in the data to detect a lagged relationship if one is there.
+
+### What Types of Food Complaints Do New Yorkers File?
+
+```{r complaint-types}
+complaints |>
+  count(complaint_type, sort = TRUE) |>
+  kable(
+    caption   = "Food-Related 311 Complaints by Type",
+    col.names = c("Complaint Type", "Count")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+Rodent complaints make up the largest share by a significant margin, followed by Food Establishment and Unsanitary Condition reports. Food Poisoning reports are actually the least common even though they are the most directly tied to a restaurant making someone sick. So most of the complaint volume driving this analysis is about rodents and general conditions, not specific illness incidents. That context matters for interpreting the results.
+
+### Food Complaints Over Time by Borough
+
+```{r borough-trends}
+complaints |>
+  group_by(borough, month) |>
+  summarise(comp_count = n(), .groups = "drop") |>
+  filter(!is.na(borough), borough != "") |>
+  ggplot(aes(x = month, y = comp_count, color = borough, group = borough)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title   = "Monthly Food-Related 311 Complaints by Borough",
+    x       = NULL,
+    y       = "Number of Complaints",
+    color   = "Borough",
+    caption = "Source: NYC 311 (2022–2026)"
+  ) +
+  theme_nyc()
+```
+
+Brooklyn and the Bronx consistently lead on complaint volume across all months. Manhattan shows more moderate levels despite having a dense restaurant scene, which probably reflects differences in neighborhood demographics and who uses 311. Staten Island has the fewest complaints throughout. The summer spikes are visible in every borough, not just one, which confirms this is a seasonal rodent pattern rather than a localized issue.
+
+### Complaint Volume vs. Inspection Outcomes by ZIP
+
+```{r zip-scatter}
+zip_annual <- zip_insp_monthly |>
+  mutate(year = year(month)) |>
+  group_by(zipcode, year) |>
+  summarise(
+    avg_pct_critical = mean(pct_critical, na.rm = TRUE),
+    avg_score        = mean(mean_score, na.rm = TRUE),
+    .groups          = "drop"
+  )
+
+zip_comp_annual <- complaints |>
+  group_by(zipcode, year) |>
+  summarise(comp_total_year = n(), .groups = "drop")
+
+zip_joined <- zip_annual |>
+  left_join(zip_comp_annual, by = c("zipcode", "year")) |>
+  left_join(acs, by = "zipcode") |>
+  filter(!is.na(comp_total_year))
+
+ggplot(zip_joined, aes(x = comp_total_year, y = avg_pct_critical)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title    = "Annual Complaint Volume vs. % Critical Violations by ZIP",
+    subtitle = "Each point is one ZIP code in one year",
+    x        = "Food-Related 311 Complaints (Annual)",
+    y        = "Avg % Critical Violations",
+    caption  = "Sources: DOHMH Inspections, NYC 311 (2022–2026)"
+  ) +
+  theme_nyc()
+```
+
+The scatter plot shows a nearly flat regression line. ZIP codes with high complaint volume in a year are not producing meaningfully higher critical violation rates. There's a lot of spread in the data but no consistent upward trend. That rules out the simple story that more complaints equals more violations.
+
+### Inspection Outcomes by Complaint Quartile
+
+```{r quartile-table}
+zip_joined |>
+  filter(!is.na(median_income)) |>
+  mutate(comp_quartile = ntile(comp_total_year, 4)) |>
+  group_by(comp_quartile) |>
+  summarise(
+    n_zipcodes     = n(),
+    avg_complaints = round(mean(comp_total_year, na.rm = TRUE), 0),
+    avg_pct_crit   = round(mean(avg_pct_critical, na.rm = TRUE), 3),
+    avg_income     = round(mean(median_income, na.rm = TRUE), 0),
+    avg_pct_pov    = round(mean(pct_poverty, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) |>
+  kable(
+    caption   = "Inspection Outcomes by Annual Complaint Quartile (Quartile 1 = fewest, 4 = most)",
+    col.names = c("Complaint Quartile", "ZIP Codes", "Avg Complaints",
+                  "Avg % Critical", "Median Income", "% in Poverty")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+Based on the table, ZIP codes in the highest complaint quartile tend to have higher poverty rates and lower median incomes. More complaints, lower income — that pattern holds. But the average critical violation rate barely moves across the four quartiles. If complaints were driving worse outcomes you would expect the % critical column to go up from Q1 to Q4. It doesn't.
+
+```{r quartile-boxplot}
+zip_joined |>
+  mutate(comp_quartile = ntile(comp_total_year, 4)) |>
+  filter(!is.na(comp_quartile)) |>
+  ggplot(aes(x = factor(comp_quartile), y = avg_pct_critical,
+             fill = factor(comp_quartile))) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "OrRd", name = "Quartile") +
+  labs(
+    title    = "Critical Violation Rate by Annual Complaint Quartile",
+    subtitle = "Quartile 1 = fewest complaints | Quartile 4 = most",
+    x        = "Complaint Quartile",
+    y        = "Avg % Critical Violations",
+    caption  = "Sources: DOHMH Inspections, NYC 311 (2022–2026)"
+  ) +
+  theme_nyc()
+```
+
+The boxplot makes the same point visually. The median critical violation rate and the spread of outcomes are almost identical across all four quartiles. There's no upward drift from Q1 to Q4. High-complaint ZIP codes are not producing worse inspection results than low-complaint ones.
+
+### Does Poverty Explain the Pattern?
+
+```{r poverty-plot}
+zip_joined |>
+  filter(!is.na(pct_poverty)) |>
+  mutate(comp_quartile = ntile(comp_total_year, 4)) |>
+  ggplot(aes(x = pct_poverty, y = avg_pct_critical,
+             color = factor(comp_quartile))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_brewer(palette = "OrRd", name = "Complaint Quartile") +
+  labs(
+    title    = "Poverty Rate vs. Critical Violation Rate by Complaint Quartile",
+    subtitle = "Quartile 1 = fewest complaints | Quartile 4 = most",
+    x        = "% Population Below Poverty Line (ACS)",
+    y        = "Avg % Critical Violations",
+    caption  = "Sources: DOHMH, NYC 311, ACS 2022"
+  ) +
+  theme_nyc()
+```
+
+Higher complaint neighborhoods tend to be lower income, which you'd expect. But the regression lines across all four complaint quartiles are basically flat regardless of poverty level. Poverty doesn't seem to drive inspection outcomes either. That rules out the concern that demographics were hiding the signal — even in the poorest, highest-complaint ZIP codes, inspection outcomes look similar to everywhere else.
+
+---
+
+## Analysis
+
+### Building the Lagged Panel
+
+```{r build-panel}
+# Shift complaint month forward by lag_months so that complaints from month T
+# can be matched to inspection outcomes from month T+N
+make_lag <- function(df, lag_months) {
+  df |>
+    mutate(month = month + months(lag_months)) |>
+    rename_with(~ paste0(.x, "_lag", lag_months), comp_total)
+}
+
+sq3_data <- zip_insp_monthly |>
+  left_join(make_lag(zip_comp_monthly, 1), by = c("zipcode", "month")) |>
+  left_join(make_lag(zip_comp_monthly, 2), by = c("zipcode", "month")) |>
+  left_join(make_lag(zip_comp_monthly, 3), by = c("zipcode", "month")) |>
+  filter(!is.na(pct_critical))
+
+cat("Panel rows for lagged analysis:", nrow(sq3_data), "\n")
+cat("Distinct ZIPs:", n_distinct(sq3_data$zipcode), "\n")
+cat("Distinct months:", n_distinct(sq3_data$month), "\n")
+```
+
+The `make_lag` function takes the complaint data and shifts the month column forward by however many months I specify. So a row in the resulting panel is basically asking: given how many complaints we saw in month *t*, how did inspections go in month *t+N*? I shift the complaint dates forward rather than shifting inspection dates backward — it's the same thing analytically but cleaner to join. The final panel has `r nrow(sq3_data)` ZIP-month rows across `r n_distinct(sq3_data$zipcode)` ZIP codes.
+
+### Lagged Correlations
+
+```{r lag-cors}
+lag_cors <- tibble(
+  lag = c("Lag 1 month", "Lag 2 months", "Lag 3 months"),
+  cor_pct_critical = c(
+    cor(sq3_data$comp_total_lag1, sq3_data$pct_critical,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag2, sq3_data$pct_critical,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag3, sq3_data$pct_critical,
+        use = "pairwise.complete.obs")
+  ),
+  cor_mean_score = c(
+    cor(sq3_data$comp_total_lag1, sq3_data$mean_score,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag2, sq3_data$mean_score,
+        use = "pairwise.complete.obs"),
+    cor(sq3_data$comp_total_lag3, sq3_data$mean_score,
+        use = "pairwise.complete.obs")
+  )
+)
+
+lag_cors |>
+  kable(
+    digits    = 4,
+    caption   = "Lagged Correlations: Complaints in Month T vs Outcomes in T+N",
+    col.names = c("Lag Window", "Cor w/ % Critical", "Cor w/ Mean Score")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+```{r lag-plot}
+lag_cors |>
+  pivot_longer(starts_with("cor_"), names_to = "outcome", values_to = "correlation") |>
+  mutate(outcome = recode(outcome,
+    "cor_pct_critical" = "% Critical Violations",
+    "cor_mean_score"   = "Mean Inspection Score"
+  )) |>
+  ggplot(aes(x = lag, y = correlation, fill = outcome)) +
+  geom_col(position = "dodge", width = 0.5) +
+  geom_hline(yintercept = 0, linewidth = 0.8) +
+  scale_fill_manual(values = c("#E76F51", "#264653"), name = "Outcome") +
+  labs(
+    title    = "Do Complaint Spikes Predict Future Inspection Outcomes?",
+    subtitle = "Pearson correlations: complaints in month T vs outcomes in T+N",
+    x        = "Complaint Lag Window",
+    y        = "Pearson Correlation",
+    caption  = "Sources: DOHMH Inspections, NYC 311 (2022–2026)"
+  ) +
+  theme_nyc()
+```
+
+The lagged correlations are small and positive across all three windows and both outcomes. For percent critical violations the values come in around 0.028 to 0.031 across the three lags. For mean inspection score they're around 0.072 to 0.076. Those numbers are way smaller than what you'd get if you just compared complaints and violations in the same month — that same-month correlation would be closer to 0.41. The gap tells you that most of the connection between complaints and violations is happening at the same time, not because complaints are leading violations by a month or two. And the 1-month and 3-month lags come out basically the same, which also doesn't support a complaints-as-early-warning interpretation.
+
+### Panel Regression with ZIP Fixed Effects
+
+```{r zip-fe-regression}
+# ZIP fixed effects absorb all time-invariant neighborhood differences.
+# Identification comes entirely from within-ZIP changes in complaint volume.
+sq3_model <- lm(
+  pct_critical ~ comp_total_lag1 + comp_total_lag2 +
+                 comp_total_lag3 + factor(zipcode),
+  data = sq3_data
+)
+
+tidy(sq3_model) |>
+  filter(str_detect(term, "comp_total_lag")) |>
+  kable(
+    digits  = 5,
+    caption = "Panel Regression (ZIP Fixed Effects): Lagged Complaints → % Critical Violations"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+Adding ZIP fixed effects strips out anything that stays constant within a neighborhood — average income levels, how many restaurants are there, how the local inspection cycle runs. What's left is just month-to-month changes within each ZIP. The question becomes: when a ZIP has more complaints than normal in a given month, do its inspection outcomes get worse a month or two later?
+
+None of the three lag coefficients are significant. Lag-1 is around 0.00010 with p = 0.455, lag-2 is around 0.00011 with p = 0.482, and lag-3 goes slightly negative at around -0.00018 with p = 0.206. The lag-3 going negative is a bit odd — that's the wrong direction for a complaints-cause-violations story. None of it comes close to significance.
+
+### OLS with Demographic Controls
+
+```{r demo-regression}
+# Annual ZIP-level panel with ACS controls
+panel_demo <- zip_joined |>
+  filter(!is.na(median_income), !is.na(pct_poverty), !is.na(pct_white))
+
+model_demo <- lm(
+  avg_pct_critical ~ comp_total_year + median_income + pct_poverty + pct_white,
+  data = panel_demo
+)
+
+tidy(model_demo) |>
+  kable(
+    digits  = 4,
+    caption = "OLS with Demographic Controls: Complaints and Critical Violation Rate"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+Adding ACS demographic controls — median income, poverty rate, and percent white — does not change the story. The complaint coefficient stays near zero and not significant. None of the demographic variables are strong predictors of inspection outcomes either. Controlling for neighborhood characteristics doesn't reveal a hidden signal; complaints still don't predict violations.
+
+### Correlation Matrix
+
+```{r cor-matrix}
+zip_joined |>
+  filter(!is.na(median_income)) |>
+  select(avg_pct_critical, comp_total_year,
+         median_income, pct_poverty, pct_white) |>
+  cor(use = "pairwise.complete.obs") |>
+  round(3) |>
+  kable(caption = "Correlation Matrix: Inspection Outcomes, Complaints, and Demographics") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+The correlation matrix confirms what the regressions show. Complaint volume and critical violation rate have essentially no linear relationship. What complaint volume is correlated with is poverty and restaurant density — higher-complaint ZIP codes tend to be lower income and more densely packed with restaurants. Median income and poverty rate are strongly negatively correlated, which just reflects that they measure the same underlying thing from opposite directions.
+
+---
+
+## Findings and Interpretation
+
+The lagged correlations come back small across all three lag windows and both outcome measures. For percent critical violations the values are around 0.028 to 0.031 across the three lags. For mean inspection score they're around 0.072 to 0.076. Those numbers are way smaller than what you'd see if you just looked at complaints and outcomes in the same month side by side. That gap is exactly the point — most of the association between complaints and violations is happening at the same time, not because complaints are predicting what's coming next.
+
+The ZIP fixed effects regression is the harder test. After removing all the stuff that stays constant within a ZIP — long-run income levels, restaurant density, inspection patterns — none of the three lag coefficients come out significant. Lag-1 is around 0.00010 with p = 0.455, lag-2 is around 0.00011 with p = 0.482, and lag-3 actually goes slightly negative at around -0.00018 with p = 0.206. That lag-3 going negative is interesting — it's going the wrong direction for a story where complaints predict future deterioration.
+
+The null result is actually informative. It's not that complaints are useless — the cross-sectional analyses show clearly that complaint volume and inspection outcomes are correlated. What these results add is the reason why. A ZIP with persistent food safety problems generates both 311 complaints and health code violations in the same months because the conditions driving both are relatively stable. When those conditions change month to month, complaints and violations shift together. Complaints are a mirror of what's happening right now, not a signal of what's coming next.
+
+I wouldn't treat this as completely settled though. Rolling inspections up to the monthly level introduces noise since inspections don't follow a calendar. The three-month window might also just be too short — if 311 complaints trigger inspections that happen within days, that response would show up in the same or next month, not three months out. And since the ZIP fixed effects model only uses within-ZIP changes, it's a harder test than comparing ZIP codes to each other, which is where the cross-sectional signal is strongest.
+
+## Connection to the Overarching Question
+
+The team's question is whether high-complaint neighborhoods have worse inspection outcomes. The answer from the cross-sectional analyses is yes. What my piece adds is the timing piece — complaints and violations aren't showing up in that order, they're showing up at the same time. The neighborhood food safety environment is persistent enough that both signals appear together rather than complaints coming first and violations following.
+
+For anyone thinking about how to actually use 311 data in food safety enforcement, that changes the recommendation. You shouldn't be monitoring complaint trends and planning to send inspectors in a few months from now. You should be treating high current complaint volume as a reason to check a neighborhood now, because that's when both signals are live. Whether a 311 complaint actually speeds up how quickly an inspection gets triggered is a different question — one that would need individual-level matching between complaints and inspection records to answer properly.
+
+## AI Usage Statement
+
+::: {.callout-note collapse="true" title="AI Usage Statement"}
+
+Generative AI tools were used in a limited capacity to assist with aspects of this analysis. AI assistance was primarily used to help structure the data pipeline, troubleshoot R coding issues, and refine code for data acquisition, joining, visualization, and modeling using packages including `tidyverse`, `lubridate`, `tidycensus`, `ggplot2`, `kableExtra`, `httr2`, and `broom`. The analytical approach, research question framing, interpretation of results, and all written discussion were completed by the author. AI outputs were reviewed, edited, and validated to ensure accuracy and appropriateness.
+
+:::
+
+------------------------------------------------------------------------
+
+This work ©2026 by Kevin Marcelin was initially prepared as an Individual Project Report for STA 9750 at Baruch College. More details about this course can be found at [the course site](https://michael-weylandt.com/STA9750) and instructions for this assignment can be found at the course project page.
